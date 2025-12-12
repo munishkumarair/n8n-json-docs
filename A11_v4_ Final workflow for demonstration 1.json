@@ -1,0 +1,503 @@
+{
+  "name": "A11_v4: Final workflow for demonstration",
+  "nodes": [
+    {
+      "parameters": {
+        "resource": "folder",
+        "operation": "search",
+        "query": "N8N"
+      },
+      "type": "n8n-nodes-base.microsoftOneDrive",
+      "typeVersion": 1,
+      "position": [
+        288,
+        144
+      ],
+      "id": "26c99cc2-d80e-4d75-9cad-3ad2601a5ed9",
+      "name": "Search a folder",
+      "credentials": {
+        "XXX": {
+          "id": "XXX",
+          "name": "XXX"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "folderId": "={{ $json.id }}"
+      },
+      "type": "n8n-nodes-base.microsoftOneDrive",
+      "typeVersion": 1,
+      "position": [
+        512,
+        144
+      ],
+      "id": "00b233f6-44d7-4424-9638-3b26aaca5f00",
+      "name": "Get items in a folder",
+      "credentials": {
+        "XXX": {
+          "id": "XXX",
+          "name": "XXX"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- Config ----\nconst LOOKUP_NODE = \"Looks for existing entry for the file\";\n\n// ---- Helpers ----\nfunction stripFences(s){ \n  if(!s) return \"\"; \n  let t=String(s).trim(); \n  if(t.startsWith(\"```\")) t=t.replace(/^```(\\w+)?/,\"\").replace(/```$/,\"\").trim(); \n  return t; \n}\n\nfunction parseLLMJson(s){ \n  const body=stripFences(s); \n  try{ return JSON.parse(body); } \n  catch(e){ \n    console.error('JSON parse error:', e); \n    return {}; \n  } \n}\n\nfunction pickSig(v){ \n  const x=String(v||\"\").trim().toLowerCase(); \n  if ([\"yes\",\"no\",\"review\"].includes(x)) return x[0].toUpperCase()+x.slice(1); \n  return \"Review\"; \n}\n\nfunction v(x){ return x == null ? \"\" : String(x); }\n\nfunction utcStamp(){ \n  const d=new Date(); \n  const p=n=>String(n).padStart(2,\"0\"); \n  return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} UTC`; \n}\n\nfunction coalesce(...vals){ \n  for (const val of vals){ \n    if (val!==undefined && val!==null && String(val).trim()!==\"\") return String(val).trim(); \n  } \n  return \"\"; \n}\n\n// Normalize duration: \"6 to 8 weeks\" → \"6–8 weeks\", \"Six weeks\" → \"6 weeks\"\nfunction normalizeDuration(s){\n  if (!s) return \"\";\n  const words = {one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9,ten:10,eleven:11,twelve:12};\n  const toNum = tok => {\n    const t = String(tok).toLowerCase().replace(/[^a-z0-9]/g,\"\");\n    if (/^\\d+$/.test(t)) return Number(t);\n    return words[t] ?? null;\n  };\n  const txt = String(s).trim();\n  let m = txt.match(/\\b(\\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\\b\\s*(?:to|-|–|—|or)\\s*(\\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\\b/i);\n  if (m){ const a=toNum(m[1]), b=toNum(m[2]); if (a && b) return `${a}–${b} weeks`; }\n  m = txt.match(/\\b(\\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\\b\\s*(?:week|weeks)\\b/i);\n  if (m){ const n=toNum(m[1]); if (n) return `${n} weeks`; }\n  return txt;\n}\n\n// ---- MAIN EXECUTION ----\ntry {\n  // ---- 1) AI JSON (previous node)\n  const jsonString = $json[\"T Text\"] ?? $json?.response?.text ?? $json?.text ?? null;\n  const llm = jsonString ? parseLLMJson(jsonString) : {};\n\n  // ---- 2) Filename — IMPROVED priority-based retrieval\n  function currentFileName(){\n    // Priority 1: Current item's binary (most reliable in loop)\n    if ($binary?.data?.fileName) return String($binary.data.fileName).trim();\n    \n    // Priority 2: Current item's JSON name\n    if ($json?.name) return String($json.name).trim();\n    \n    // Priority 3: From loop item directly\n    try {\n      const loopItem = $('Loops over each file in the OneDrive folder').item.json;\n      if (loopItem?.name) return String(loopItem.name).trim();\n    } catch {}\n    \n    // Priority 4: From Download node in current item context\n    try {\n      const downloadNode = $('Downloads the file to add as attachment');\n      const n = downloadNode?.binary?.data?.fileName || downloadNode?.json?.name;\n      if (n) return String(n).trim();\n    } catch {}\n    \n    // Priority 5: Legacy - check if file_name was set\n    if ($json?.file_name) return String($json.file_name).trim();\n    \n    console.warn('Could not determine filename');\n    return \"unknown_file.pdf\";\n  }\n  const fileName = currentFileName();\n\n  // ---- 3) Determine if this is an UPDATE — IMPROVED detection\n  function isUpdate() {\n    try {\n      const lookupResult = $item(0).$node[LOOKUP_NODE]?.json;\n      if (!lookupResult) return false;\n      \n      // If lookup returned data, it's an update\n      const hasData = Object.keys(lookupResult).length > 0;\n      \n      // Additional check: if there's an \"Engagement Letter Name\" match\n      if (lookupResult[\"Engagement Letter Name\"]) return true;\n      \n      return hasData;\n    } catch(e) {\n      console.error('isUpdate check error:', e);\n      return false;\n    }\n  }\n  const isUpdating = isUpdate();\n\n  // ---- 4) Status from signatures\n  const sClient = pickSig(llm.signed_by_client);\n  const sLEK    = pickSig(llm.signed_by_lek);\n  let statusJ;\n  \n  if (sClient === \"Yes\" && sLEK === \"Yes\") {\n    statusJ = \"Complete\";\n  } else if (sClient === \"Review\" || sLEK === \"Review\") {\n    statusJ = \"Needs to be reviewed\";\n  } else if ((sLEK === \"Yes\" && sClient === \"No\") || (sLEK === \"No\" && sClient === \"No\")) {\n    statusJ = \"Get client signature\";\n  } else if (sClient === \"Yes\" && sLEK === \"No\") {\n    statusJ = \"Get MD signature\";\n  } else {\n    statusJ = \"Needs to be reviewed\";\n  }\n\n  // ---- 5) Costs\n  const costAggregate = coalesce(llm.engagement_cost, llm.cost_of_engagement, llm.aggregate_cost);\n  const costPerWeek   = coalesce(llm.per_week_cost, \"NA\");\n\n  // ---- 6) Final row\n  const row = {\n    \"Engagement Letter Name\": v(fileName),\n    \"Client name\":            v(llm.client_name),\n    \"Start date\":             v(llm.start_date_text),\n    \"Cost of Engagement\":     v(costAggregate),\n    \"Per week\":               v(costPerWeek),\n    \"Duration\":               normalizeDuration(llm.duration_text),\n    \"Last updated\":           utcStamp(),\n    \"Signed by client\":       v(sClient),\n    \"Signed by LEK\":          v(sLEK),\n    \"Status\":                 v(statusJ),\n    \"Updated\":                isUpdating ? \"Yes\" : \"No\"\n  };\n  \n  return [{ json: row }];\n\n} catch(error) {\n  console.error('Form rows execution error:', error);\n  \n  // Return error row to prevent workflow failure\n  return [{ \n    json: { \n      \"Engagement Letter Name\": \"ERROR - See logs\",\n      \"Client name\": \"\",\n      \"Start date\": \"\",\n      \"Cost of Engagement\": \"\",\n      \"Per week\": \"\",\n      \"Duration\": \"\",\n      \"Last updated\": utcStamp(),\n      \"Signed by client\": \"\",\n      \"Signed by LEK\": \"\",\n      \"Status\": \"Processing Error\",\n      \"Updated\": \"Error\",\n      \"Error Details\": String(error.message || error)\n    } \n  }];\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1968,
+        -128
+      ],
+      "id": "6be59a73-8b1f-41ac-b411-15acff2fb772",
+      "name": "Form rows"
+    },
+    {
+      "parameters": {
+        "content": "Enter folder name here",
+        "height": 208,
+        "width": 198
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        240,
+        96
+      ],
+      "typeVersion": 1,
+      "id": "142a7faa-a9ca-4584-bbd9-98c96952d3d3",
+      "name": "Sticky Note5"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {}
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        64,
+        144
+      ],
+      "id": "99f07273-36e0-4481-b7d7-5927e56c0e40",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://9833f0f52aa7.ngrok-free.app/ocr",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "data"
+            }
+          ]
+        },
+        "options": {
+          "allowUnauthorizedCerts": true,
+          "timeout": 10000000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1392,
+        -128
+      ],
+      "id": "9016f125-7048-426e-9e15-2aad9054a3a7",
+      "name": "Run OCR"
+    },
+    {
+      "parameters": {
+        "content": "## Path runs on each file that is new or marked as Verified for updates",
+        "height": 320,
+        "width": 1744
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        608,
+        -240
+      ],
+      "typeVersion": 1,
+      "id": "d41a44a1-5dea-4db3-8be1-245283906671",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{$json.system + \"\\n\\n\" + $json.user}}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "=You are an expert at detecting signatures in OCR of engagement letter documents. Return one JSON object only (no prose, no markdown) with keys: engagement_letter_name, client_name, start_date_text, duration_text, engagement_cost, per_week_cost, signed_by_client, signed_by_lek.\\n\\nclient_name = company name only (never a person's name).\\n\\nstart_date_text and duration_text must be Excel-ready; if multiple options exist, include both in order separated by \\\" or \\\" (e.g., \\\"November 28, 2025\\\" or \\\"6 weeks or 8 weeks\\\").\\n\\nCOST RULES: Search \\\"Team, Timing and Compensation\\\"/\\\"Fees\\\"/\\\"Professional fees\\\" sections and nearby text. Set engagement_cost to the fixed-fee option(s) exactly as written, joined by \\\" or \\\" if more than one appears (e.g., \\\"$600,000 or $750,000\\\"). Set per_week_cost to the weekly rate if it exists (e.g., \\\"$125,000 per week\\\"); if no weekly rate is present, set per_week_cost to \\\"NA\\\". If a sentence contains both a weekly rate and a total (e.g., \\\"$125,000 per week, or $750,000 in the aggregate\\\"), then engagement_cost=\\\"$750,000\\\" and per_week_cost=\\\"$125,000 per week\\\". Do not include words like \\\"plus expenses/taxes\\\" or narrative around the numbers; capture only the price strings. Do not invent values; if no fixed-fee is stated, engagement_cost=null.\\n\\nSIGNATURE DETECTION RULES (CRITICAL):\\nThere are two independent signature blocks to evaluate:\\n1. LEK block: starts after \\\"Sincerely yours\\\"/\\\"Yours sincerely\\\" near \\\"L.E.K. CONSULTING\\\"\\n2. Client block: starts after \\\"Agreed,\\\"/\\\"Agreed by\\\"/\\\"hereby agree\\\" near the client company name\\n\\nFor EACH block, evaluate signed_by_lek and signed_by_client as follows:\\n\\nSet to \\\"Yes\\\" if ANY of these signature indicators are present:\\n- Explicit signature placeholders: \\\"<Signature>\\\", \\\"[Signature]\\\", \\\"By: [Signature]\\\", \\\"__________\\\" (signature line)\\n- Digital signature markers: \\\"/s/\\\", \\\"digitally signed by\\\", \\\"DocuSign\\\", \\\"Adobe Sign\\\", or e-signature artifacts\\n- A standalone person's name or initials appearing directly under the signature block WITHOUT preceding labels like \\\"Name:\\\" or \\\"Title:\\\" (this indicates OCR captured a handwritten/digital signature)\\n- A typed full name appearing alone on a line in the signature area (e.g., \\\"John Smith\\\" on its own line)\\n\\nSet to \\\"No\\\" ONLY if:\\n- The signature block is completely missing, OR\\n- Only the company name line exists with no other content, OR\\n- The block explicitly states \\\"UNSIGNED\\\" or similar\\n\\nSet to \\\"Review\\\" ONLY if:\\n- There are \\\"Name:\\\" and/or \\\"Title:\\\" labels present with blank spaces after them (indicating fields waiting to be filled)\\n- There are \\\"Name:\\\" and \\\"Title:\\\" labels with the same text repeated (like \\\"Name: ABC Corp\\\" and company line \\\"ABC Corp\\\" - this means no actual person signed)\\n- The block has timestamp or date fields filled but no clear signature indicator\\n- You're uncertain whether what OCR captured is a signature or just printed text\\n\\nIMPORTANT: If OCR captured any person's name (not just company name) appearing standalone in the signature area, this is almost certainly a signature - mark it \\\"Yes\\\", not \\\"Review\\\".\\n\\nExamples:\\n- \\\"By: /s/ Jane Doe\\\" → Yes\\n- \\\"<Signature>\\\\nName: Jane Doe\\\\nTitle: CEO\\\" → Yes\\n- \\\"Jane Doe\\\" (standalone name on line) → Yes\\n- \\\"Name: _______\\\\nTitle: _______\\\" → Review\\n- \\\"Name: ABC Corp\\\\n[Company: ABC Corp]\\\" → Review\\n- \\\"ABC Corp\\\" (only company, nothing else) → No\\n- Empty/missing block → No\\n\\nCount each party exactly once and map to signed_by_lek and signed_by_client by their proximity to LEK vs Client company names.\\n\\nUse null for truly missing fields. Output compact values only."
+            },
+            {
+              "type": "HumanMessagePromptTemplate",
+              "message": "=Here is the OCR text of the entire document:\n{{ \n  Array.isArray($json.pages) \n    ? $json.pages.map(p => p.text || \"\").join(\"\\n\\n\") \n    : ($json.text || \"\")\n}}"
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        1616,
+        -128
+      ],
+      "id": "327b7881-8662-44d8-b62d-47037374468a",
+      "name": "Extract data points"
+    },
+    {
+      "parameters": {
+        "model": "transform-gpt-5-nano",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAzureOpenAi",
+      "typeVersion": 1,
+      "position": [
+        1616,
+        0
+      ],
+      "id": "58d4d785-d4d8-4487-8d64-a67286ffb2b2",
+      "name": "AI node",
+      "credentials": {
+        "XXX": {
+          "id": "XXX",
+          "name": "XXX"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {
+          "reset": false
+        }
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        944,
+        144
+      ],
+      "id": "e217510a-12ba-4733-99ba-4e0587c2d9cd",
+      "name": "Loops over each file in the OneDrive folder"
+    },
+    {
+      "parameters": {
+        "resource": "table",
+        "operation": "lookup",
+        "workbook": {
+          "__rl": true,
+          "value": "01EFO3JU3ZFADIBFQHLVFIEEHLPRPRKG2U",
+          "mode": "list",
+          "cachedResultName": "EL_Signature tracker_Dummy",
+          "cachedResultUrl": "XXX"
+        },
+        "worksheet": {
+          "__rl": true,
+          "value": "{00000000-0001-0000-0000-000000000000}",
+          "mode": "list",
+          "cachedResultName": "Engagement letters",
+          "cachedResultUrl": "XXX"
+        },
+        "table": {
+          "__rl": true,
+          "value": "{867618A4-C6A6-491D-B673-911079112C49}",
+          "mode": "list",
+          "cachedResultName": "Table1",
+          "cachedResultUrl": "XXX"
+        },
+        "lookupColumn": "Engagement Letter Name",
+        "lookupValue": "={{$json.name}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.microsoftExcel",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        -112
+      ],
+      "id": "4ecbc8d7-ea35-4a3d-9c2c-75780a528a2f",
+      "name": "Looks for existing entry for the file",
+      "credentials": {
+        "XXX": {
+          "id": "XXX",
+          "name": "XXX"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e9409dba-a6c6-4036-993e-e3df98e4634e",
+              "leftValue": "={{ !$json || !['corrected (lock)', 'archived'].includes(($json['Reviewed'] || '').toString().trim().toLowerCase()) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        944,
+        -112
+      ],
+      "id": "23b5f637-cbf0-40a7-9a26-c49eb8d6c964",
+      "name": "Skips it if marked Archived or Corrected"
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": "={{ $('Loops over each file in the OneDrive folder').item.json.id }}"
+      },
+      "type": "n8n-nodes-base.microsoftOneDrive",
+      "typeVersion": 1,
+      "position": [
+        1184,
+        -128
+      ],
+      "id": "e9204f09-61fa-4631-8140-9b46d3fd8624",
+      "name": "Downloads the file to add as attachment",
+      "credentials": {
+        "XXX": {
+          "id": "XXX",
+          "name": "XXX"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "table",
+        "workbook": {
+          "__rl": true,
+          "value": "01EFO3JU3ZFADIBFQHLVFIEEHLPRPRKG2U",
+          "mode": "list",
+          "cachedResultName": "EL_Signature tracker_Dummy",
+          "cachedResultUrl": "XXX"
+        },
+        "worksheet": {
+          "__rl": true,
+          "value": "{00000000-0001-0000-0000-000000000000}",
+          "mode": "list",
+          "cachedResultName": "Engagement letters",
+          "cachedResultUrl": "XXX"
+        },
+        "table": {
+          "__rl": true,
+          "value": "{867618A4-C6A6-491D-B673-911079112C49}",
+          "mode": "list",
+          "cachedResultName": "Table1",
+          "cachedResultUrl": "XXX"
+        },
+        "dataMode": "autoMap",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.microsoftExcel",
+      "typeVersion": 2.1,
+      "position": [
+        2192,
+        -128
+      ],
+      "id": "93076164-e6b8-43bc-9856-847833f0f0c6",
+      "name": "Updates the excel file",
+      "credentials": {
+        "XXX": {
+          "id": "XXX",
+          "name": "XXX"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "### Link to current folder used: XXX"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        224,
+        336
+      ],
+      "typeVersion": 1,
+      "id": "3de63116-2949-48df-9282-4efe894cc0c6",
+      "name": "Sticky Note1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Search a folder": {
+      "main": [
+        [
+          {
+            "node": "Get items in a folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get items in a folder": {
+      "main": [
+        [
+          {
+            "node": "Loops over each file in the OneDrive folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Form rows": {
+      "main": [
+        [
+          {
+            "node": "Updates the excel file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Search a folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run OCR": {
+      "main": [
+        [
+          {
+            "node": "Extract data points",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract data points": {
+      "main": [
+        [
+          {
+            "node": "Form rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI node": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Extract data points",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loops over each file in the OneDrive folder": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Looks for existing entry for the file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Looks for existing entry for the file": {
+      "main": [
+        [
+          {
+            "node": "Skips it if marked Archived or Corrected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skips it if marked Archived or Corrected": {
+      "main": [
+        [
+          {
+            "node": "Downloads the file to add as attachment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loops over each file in the OneDrive folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Downloads the file to add as attachment": {
+      "main": [
+        [
+          {
+            "node": "Run OCR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Updates the excel file": {
+      "main": [
+        [
+          {
+            "node": "Loops over each file in the OneDrive folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "8d2fb974-fc1c-4717-94a9-433656dd74f2",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "b2f2138fc9a64f252be6cc9dde49a293df8b0d3d693ff7b2bd3937054ad61bbe"
+  },
+  "id": "3TUKEbxKdaN9zrZN",
+  "tags": []
+}
